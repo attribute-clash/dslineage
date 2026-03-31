@@ -1,78 +1,124 @@
-# RUNBOOK: Построение lineage DataStage Parallel Jobs в MS SQL Server
+# RUNBOOK: Построение сжатого lineage из `dbo.T_LNG_DS_JOB_OBJECT`
 
-## 1. Предварительные требования
+## 1. Что изменилось
 
-1. Доступ к MS SQL Server с правами на создание таблиц/процедур/представлений в `dbo`.
-2. Настроенный Linked Server к DB2-репозиторию DataStage (пример имени: `DB2_DS_REPO`).
-3. Учетная запись DB2 для Linked Server имеет права только на чтение метаданных.
+В этом решении **нет загрузки из DataStage/DB2**. Предполагается, что исходные данные уже лежат в таблице:
 
-## 2. Разовое развертывание
+- `dbo.T_LNG_DS_JOB_OBJECT`
 
-Выполните SQL-скрипт:
+Процедура строит граф колонок по `PREV_STAGE_NAME/NEXT_STAGE_NAME`, `DERIVATION`, `SOURCECOLUMNID`, а затем пишет **сжатые пути** в итоговую таблицу.
+
+## 2. Ожидаемая структура входной таблицы
+
+Источник:
+
+- `dbo.T_LNG_DS_JOB_OBJECT`
+
+Ключевые поля, используемые алгоритмом:
+- `DSNAMESPACE` (проект)
+- `JOB_NAME`
+- `STAGE_NAME`
+- `PREV_STAGE_NAME`
+- `NEXT_STAGE_NAME`
+- `COLUMN_NAME`
+- `DERIVATION`
+- `SOURCECOLUMNID`
+
+## 3. Что создает скрипт `sql/lineage_full_setup.sql`
+
+1. Лог запусков:
+   - `dbo.T_LNG_DS_RUN_LOG`
+2. Детальные ребра графа колонок:
+   - `dbo.T_LNG_DS_COLUMN_EDGE`
+3. Итоговый сжатый lineage:
+   - `dbo.T_LNG_DS_LINEAGE_COMPRESSED`
+4. View с последним успешным результатом:
+   - `dbo.V_LNG_DS_LINEAGE_LATEST`
+5. Основная процедура расчета:
+   - `dbo.usp_lng_ds_build_lineage`
+
+## 4. Развертывание
+
+Выполните:
 
 ```sql
 :r .\sql\lineage_full_setup.sql
 ```
 
-Или откройте файл в SSMS и выполните целиком.
+или запустите содержимое файла в SSMS.
 
-## 3. Первичная настройка источников DB2
+## 5. Запуск расчета lineage
 
-1. Проверить шаблоны выгрузки:
+### 5.1 Все проекты и все jobs
+
+```sql
+EXEC dbo.usp_lng_ds_build_lineage;
+```
+
+### 5.2 Только выбранные проекты
+
+```sql
+EXEC dbo.usp_lng_ds_build_lineage
+     @project_list_csv = 'PROJECT_A,PROJECT_B';
+```
+
+### 5.3 Фильтр по имени job
+
+```sql
+EXEC dbo.usp_lng_ds_build_lineage
+     @job_name_like = 'LOAD_%';
+```
+
+### 5.4 С фильтром проектов + job
+
+```sql
+EXEC dbo.usp_lng_ds_build_lineage
+     @project_list_csv = 'PROJECT_A,PROJECT_B',
+     @job_name_like    = 'FIN_%',
+     @max_depth        = 300;
+```
+
+## 6. Где смотреть результат
+
+### 6.1 Последний успешный запуск
 
 ```sql
 SELECT *
-FROM dbo.ctl_db2_extract_query
-ORDER BY load_order;
+FROM dbo.V_LNG_DS_LINEAGE_LATEST;
 ```
 
-2. Заменить плейсхолдеры (`xmeta.projects`, `xmeta.jobs` и т.д.) на реальные таблицы/представления вашего репозитория DB2.
-3. Убедиться, что каждая `remote_sql` возвращает колонки в том же порядке, что и целевая таблица `dbo.raw_ds_*`.
-
-## 4. Полный запуск пайплайна lineage
-
-```sql
-EXEC dbo.ctl_usp_run_full_lineage
-     @linked_server = 'DB2_DS_REPO',
-     @project_csv   = 'PROJECT_A,PROJECT_B',
-     @max_depth     = 200;
-```
-
-Что делает оркестратор:
-1. Обновляет фильтр проектов в `dbo.ctl_project_filter`.
-2. Делает полную загрузку метаданных из DB2 в `dbo.raw_ds_*`.
-3. Готовит граф зависимостей в `dbo.stg_ds_*`.
-4. Вычисляет детальный lineage (`dbo.lineage_column_lineage_detailed`).
-5. Вычисляет схлопнутый lineage (`dbo.lineage_column_lineage_collapsed`).
-6. Публикует итог в `dbo.lineage_column_lineage_export`.
-
-## 5. Где смотреть результаты
-
-1. Последняя успешная выгрузка:
-
-```sql
-SELECT * FROM dbo.lineage_vw_latest_export;
-```
-
-2. Результаты конкретного запуска:
+### 6.2 Результат по конкретному RUN_ID
 
 ```sql
 SELECT *
-FROM dbo.lineage_column_lineage_export
-WHERE run_id = <run_id>;
+FROM dbo.T_LNG_DS_LINEAGE_COMPRESSED
+WHERE RUN_ID = <RUN_ID>
+ORDER BY DSNAMESPACE, JOB_NAME, SOURCE_STAGE_NAME, SOURCE_COLUMN_NAME;
 ```
 
-3. Статистика запусков и шагов:
+### 6.3 Лог запусков
 
 ```sql
-SELECT * FROM dbo.lineage_vw_run_stats ORDER BY run_id DESC;
-SELECT * FROM dbo.ctl_etl_run_step WHERE run_id = <run_id> ORDER BY run_step_id;
+SELECT *
+FROM dbo.T_LNG_DS_RUN_LOG
+ORDER BY RUN_ID DESC;
 ```
 
-## 6. Важные замечания
+## 7. Как работает компрессия
 
-- Реализован режим только **full load + full recompute**.
-- Sequence jobs и Server jobs исключены из области расчета.
-- Фильтр проектов обязателен (по именам проектов).
-- Если у вас отличия синтаксиса DB2, корректируйте `remote_sql` в `dbo.ctl_db2_extract_query`.
-- Все объекты созданы в одной схеме `dbo`, группировка сделана префиксами: `ctl_`, `raw_ds_`, `stg_ds_`, `lineage_`.
+1. Для каждой целевой колонки на stage ищутся входные колонки из `PREV_STAGE_NAME`.
+2. Приоритет маппинга:
+   1) `SOURCECOLUMNID` содержит имя входной колонки,
+   2) `DERIVATION` содержит имя входной колонки,
+   3) fallback: одинаковые имена колонок (`SAME_NAME`).
+3. Строится граф зависимостей колонок.
+4. Выполняется обход от входных stage-колонок (где `PREV_STAGE_NAME` пуст) до выходных (где `NEXT_STAGE_NAME` пуст).
+5. В итог пишется одна строка на пару Source→Target с минимальным количеством шагов (сжатый путь).
+
+## 8. Примечания
+
+- Если в `DERIVATION/SOURCECOLUMNID` используются нестандартные форматы имен колонок, правила матчинга можно расширить в CTE `candidate_edge`.
+- `PATH_TEXT` хранит один из кратчайших найденных путей для диагностики.
+- Тип зависимости:
+  - `DIRECT` — только проходные/одноименные связи,
+  - `DERIVED` — по пути есть связь через `DERIVATION` или `SOURCECOLUMNID`.
